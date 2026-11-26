@@ -38,13 +38,31 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markerRef = useRef<L.Marker | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
 
   const [geoLoading, setGeoLoading] = useState(false);
   const [geoNotice, setGeoNotice] = useState<{ type: 'success' | 'warning' | 'info'; message: string } | null>(null);
+  const [showManualCoords, setShowManualCoords] = useState(false);
+  const [manualLatInput, setManualLatInput] = useState(latitude !== undefined ? String(latitude) : '');
+  const [manualLngInput, setManualLngInput] = useState(longitude !== undefined ? String(longitude) : '');
+  const [manualCoordError, setManualCoordError] = useState<string | null>(null);
 
-  // Default coordinate if none selected: Bengaluru or district center
-  const currentLat = latitude ?? 12.9716;
-  const currentLng = longitude ?? 77.5946;
+  const hasCoordinates = typeof latitude === 'number' && !isNaN(latitude) && typeof longitude === 'number' && !isNaN(longitude);
+
+  // Sync manual coordinate inputs when coordinates change externally (map click / GPS)
+  useEffect(() => {
+    if (typeof latitude === 'number' && !isNaN(latitude)) {
+      setManualLatInput(latitude.toFixed(6));
+    } else {
+      setManualLatInput('');
+    }
+    if (typeof longitude === 'number' && !isNaN(longitude)) {
+      setManualLngInput(longitude.toFixed(6));
+    } else {
+      setManualLngInput('');
+    }
+  }, [latitude, longitude]);
 
   // Custom icon for the incident pin
   const createPinIcon = useCallback(() => {
@@ -79,15 +97,60 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
     });
   }, []);
 
-  // 1. Initialize Map
+  const ensureMarkerAt = useCallback((map: L.Map, lat: number, lng: number) => {
+    if (markerRef.current) {
+      markerRef.current.setLatLng([lat, lng]);
+      return markerRef.current;
+    }
+    const marker = L.marker([lat, lng], {
+      draggable: true,
+      icon: createPinIcon()
+    }).addTo(map);
+
+    marker.bindTooltip('Drag or click map to adjust exact hazard location', {
+      permanent: false,
+      direction: 'top'
+    });
+
+    marker.on('dragend', (e) => {
+      const markerInstance = e.target as L.Marker;
+      const pos = markerInstance.getLatLng();
+      const nextLat = parseFloat(pos.lat.toFixed(6));
+      const nextLng = parseFloat(pos.lng.toFixed(6));
+      onChangeRef.current({
+        latitude: nextLat,
+        longitude: nextLng,
+        locationVerified: false
+      });
+      setManualCoordError(null);
+      setGeoNotice({
+        type: 'info',
+        message: `Incident pin moved to [${nextLat.toFixed(5)}, ${nextLng.toFixed(5)}]. Click "Confirm This Location" when ready.`
+      });
+    });
+
+    markerRef.current = marker;
+    return marker;
+  }, [createPinIcon]);
+
+  // 1. Initialize Map (runs once; never tears down on form input changes)
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
     try {
-      const initialCenter: [number, number] = [currentLat, currentLng];
+      const initialDistrict = KARNATAKA_DISTRICTS.find(
+        d => d.name.toLowerCase() === district.toLowerCase()
+      );
+      const initialCenter: [number, number] = hasCoordinates
+        ? [latitude!, longitude!]
+        : initialDistrict
+          ? initialDistrict.center
+          : KARNATAKA_STATE_CENTER;
+      const initialZoom = hasCoordinates ? 14 : initialDistrict ? 11 : 7;
+
       const map = L.map(mapContainerRef.current, {
         center: initialCenter,
-        zoom: latitude && longitude ? 14 : 11,
+        zoom: initialZoom,
         minZoom: 6,
         maxZoom: 18,
         attributionControl: false
@@ -98,49 +161,28 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
         attribution: '&copy; OpenStreetMap'
       }).addTo(map);
 
-      // Add draggable marker
-      const marker = L.marker(initialCenter, {
-        draggable: true,
-        icon: createPinIcon()
-      }).addTo(map);
-
-      marker.bindTooltip('Drag or click map to adjust exact hazard location', {
-        permanent: false,
-        direction: 'top'
-      });
-
-      // Handle marker drag
-      marker.on('dragend', (e) => {
-        const markerInstance = e.target as L.Marker;
-        const pos = markerInstance.getLatLng();
-        onChange({
-          latitude: parseFloat(pos.lat.toFixed(6)),
-          longitude: parseFloat(pos.lng.toFixed(6)),
-          locationVerified: false // Manually placed
-        });
-        setGeoNotice({
-          type: 'info',
-          message: `Incident pin moved manually to [${pos.lat.toFixed(5)}, ${pos.lng.toFixed(5)}].`
-        });
-      });
+      if (hasCoordinates) {
+        ensureMarkerAt(map, latitude!, longitude!);
+      }
 
       // Handle map click
       map.on('click', (e: L.LeafletMouseEvent) => {
-        const { lat, lng } = e.latlng;
-        marker.setLatLng([lat, lng]);
-        onChange({
-          latitude: parseFloat(lat.toFixed(6)),
-          longitude: parseFloat(lng.toFixed(6)),
+        const nextLat = parseFloat(e.latlng.lat.toFixed(6));
+        const nextLng = parseFloat(e.latlng.lng.toFixed(6));
+        ensureMarkerAt(map, nextLat, nextLng);
+        onChangeRef.current({
+          latitude: nextLat,
+          longitude: nextLng,
           locationVerified: false
         });
+        setManualCoordError(null);
         setGeoNotice({
           type: 'info',
-          message: `Location set to [${lat.toFixed(5)}, ${lng.toFixed(5)}]. Drag pin if fine-tuning is needed.`
+          message: `Pin placed at [${nextLat.toFixed(5)}, ${nextLng.toFixed(5)}]. Click "Confirm This Location" to verify.`
         });
       });
 
       mapInstanceRef.current = map;
-      markerRef.current = marker;
 
       // Invalidate size after mount
       setTimeout(() => {
@@ -154,53 +196,120 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
       if (mapInstanceRef.current) {
         mapInstanceRef.current.remove();
         mapInstanceRef.current = null;
+        markerRef.current = null;
       }
     };
-  }, [createPinIcon, onChange]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ensureMarkerAt]);
 
-  // 2. React to external coordinate updates
+  // 2. React to external coordinate updates (including clearing on reset)
   useEffect(() => {
-    if (markerRef.current && latitude && longitude) {
-      markerRef.current.setLatLng([latitude, longitude]);
-    }
-  }, [latitude, longitude]);
+    const map = mapInstanceRef.current;
+    if (!map) return;
 
-  // 3. District selector change
+    if (hasCoordinates) {
+      ensureMarkerAt(map, latitude!, longitude!);
+    } else if (markerRef.current) {
+      markerRef.current.remove();
+      markerRef.current = null;
+    }
+  }, [hasCoordinates, latitude, longitude, ensureMarkerAt]);
+
+  // 3. District selector change (centers map without inventing hazard coordinates)
   const handleDistrictChange = (selectedDistName: string) => {
     const distData = KARNATAKA_DISTRICTS.find(d => d.name.toLowerCase() === selectedDistName.toLowerCase());
     if (distData) {
       onChange({
-        district: distData.name,
-        latitude: distData.center[0],
-        longitude: distData.center[1],
-        locationVerified: false
+        district: distData.name
       });
 
-      if (mapInstanceRef.current && markerRef.current) {
+      if (mapInstanceRef.current) {
         mapInstanceRef.current.setView(distData.center, 12, { animate: true });
-        markerRef.current.setLatLng(distData.center);
       }
       setGeoNotice({
         type: 'info',
-        message: `Centered map on ${distData.name} headquarters. Tap or drag the pin to your specific street.`
+        message: `Centered map on ${distData.name}. Tap the map, use GPS, enter coordinates manually, or click "Pin District Center" to set the location.`
       });
     } else {
       onChange({ district: selectedDistName });
     }
   };
 
-  // 4. "Use My Location" Geolocation action
-  const handleUseMyLocation = () => {
-    if (!navigator.geolocation) {
+  // 4. Explicit district headquarters pin action (never silent)
+  const handlePinDistrictCenter = () => {
+    const distData = KARNATAKA_DISTRICTS.find(d => d.name.toLowerCase() === district.toLowerCase());
+    if (!distData) {
       setGeoNotice({
         type: 'warning',
-        message: 'Browser Geolocation is not supported by your current browser. Please pick your location directly on the map.'
+        message: 'Please select a Karnataka district first before pinning its center.'
+      });
+      return;
+    }
+    const [lat, lng] = distData.center;
+    onChange({
+      latitude: lat,
+      longitude: lng,
+      locationVerified: false
+    });
+    if (mapInstanceRef.current) {
+      mapInstanceRef.current.setView([lat, lng], 13, { animate: true });
+      ensureMarkerAt(mapInstanceRef.current, lat, lng);
+    }
+    setManualCoordError(null);
+    setGeoNotice({
+      type: 'info',
+      message: `Pinned ${distData.name} headquarters [${lat.toFixed(5)}, ${lng.toFixed(5)}]. Drag the pin to your exact street and click "Confirm This Location".`
+    });
+  };
+
+  // 5. Manual Latitude / Longitude entry handler
+  const handleApplyManualCoordinates = () => {
+    setManualCoordError(null);
+    const parsedLat = parseFloat(manualLatInput.trim());
+    const parsedLng = parseFloat(manualLngInput.trim());
+
+    if (isNaN(parsedLat) || isNaN(parsedLng)) {
+      setManualCoordError('Please enter valid numeric Latitude and Longitude values.');
+      return;
+    }
+    if (parsedLat < 11.0 || parsedLat > 19.0 || parsedLng < 73.5 || parsedLng > 79.5) {
+      setManualCoordError('Coordinates must fall within Karnataka bounds (Latitude 11.0–19.0° N, Longitude 73.5–79.5° E).');
+      return;
+    }
+
+    const cleanLat = parseFloat(parsedLat.toFixed(6));
+    const cleanLng = parseFloat(parsedLng.toFixed(6));
+
+    onChange({
+      latitude: cleanLat,
+      longitude: cleanLng,
+      locationVerified: true
+    });
+
+    if (mapInstanceRef.current) {
+      mapInstanceRef.current.setView([cleanLat, cleanLng], 15, { animate: true });
+      ensureMarkerAt(mapInstanceRef.current, cleanLat, cleanLng);
+    }
+    setGeoNotice({
+      type: 'success',
+      message: `Manual coordinates [${cleanLat.toFixed(5)}, ${cleanLng.toFixed(5)}] applied and displayed on map.`
+    });
+  };
+
+  // 6. "Use My Location" Geolocation action
+  const handleUseMyLocation = () => {
+    if (!navigator.geolocation) {
+      setShowManualCoords(true);
+      setGeoNotice({
+        type: 'warning',
+        message: 'Browser Geolocation is not supported by your browser. Please click on the map or enter coordinates manually.'
       });
       return;
     }
 
     setGeoLoading(true);
     setGeoNotice(null);
+    setManualCoordError(null);
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
@@ -208,41 +317,42 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
         const userLat = parseFloat(position.coords.latitude.toFixed(6));
         const userLng = parseFloat(position.coords.longitude.toFixed(6));
 
-        // Check if inside or near Karnataka bounds roughly [11.5 to 18.5 Lat, 74.0 to 78.6 Lng]
-        const isNearKarnataka = userLat >= 11.0 && userLat <= 19.0 && userLng >= 73.5 && userLng <= 79.0;
+        // Check if inside or near Karnataka bounds roughly [11.0 to 19.0 Lat, 73.5 to 79.5 Lng]
+        const isNearKarnataka = userLat >= 11.0 && userLat <= 19.0 && userLng >= 73.5 && userLng <= 79.5;
 
         onChange({
           latitude: userLat,
           longitude: userLng,
-          locationVerified: true
+          locationVerified: isNearKarnataka
         });
 
-        if (mapInstanceRef.current && markerRef.current) {
+        if (mapInstanceRef.current) {
           mapInstanceRef.current.setView([userLat, userLng], 15, { animate: true });
-          markerRef.current.setLatLng([userLat, userLng]);
+          ensureMarkerAt(mapInstanceRef.current, userLat, userLng);
         }
 
         if (isNearKarnataka) {
           setGeoNotice({
             type: 'success',
-            message: `Accurate device GPS coordinates detected [${userLat}, ${userLng}] with ±${Math.round(position.coords.accuracy)}m precision.`
+            message: `Device GPS coordinates detected [${userLat.toFixed(5)}, ${userLng.toFixed(5)}] with ±${Math.round(position.coords.accuracy)}m precision.`
           });
         } else {
           setGeoNotice({
-            type: 'info',
-            message: `Detected device coordinates [${userLat}, ${userLng}]. If this is outside Karnataka, please select your incident district.`
+            type: 'warning',
+            message: `Detected device coordinates [${userLat.toFixed(5)}, ${userLng.toFixed(5)}] appear outside Karnataka. Please click on the map or enter your Karnataka incident coordinates manually.`
           });
         }
       },
       (error) => {
         setGeoLoading(false);
-        let msg = 'Unable to retrieve your current location. Please pick your position on the map.';
+        setShowManualCoords(true);
+        let msg = 'Unable to retrieve your current location. Please pick your position on the map or enter coordinates manually.';
         if (error.code === error.PERMISSION_DENIED) {
-          msg = 'Location permission was denied. You can manually drag the pin or click anywhere on the map to mark the problem location.';
+          msg = 'Location permission was denied. You can click anywhere on the map, enter coordinates manually, or pin your district center.';
         } else if (error.code === error.POSITION_UNAVAILABLE) {
-          msg = 'Location signal unavailable. Please use the interactive map picker or enter street details manually.';
+          msg = 'Location signal is currently unavailable. Please use the interactive map picker or manual location entry below.';
         } else if (error.code === error.TIMEOUT) {
-          msg = 'Location request timed out. Please click on the map to pinpoint your location.';
+          msg = 'Location request timed out. Please click on the map or enter coordinates manually.';
         }
         setGeoNotice({
           type: 'warning',
@@ -489,7 +599,7 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
             </span>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <button
               type="button"
               onClick={handleUseMyLocation}
@@ -513,6 +623,50 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
               <Navigation size={14} className={geoLoading ? 'animate-spin' : ''} />
               {geoLoading ? 'Detecting GPS...' : 'Use My Location'}
             </button>
+
+            <button
+              type="button"
+              onClick={() => setShowManualCoords(prev => !prev)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+                padding: '0.45rem 0.65rem',
+                backgroundColor: showManualCoords ? 'rgba(13, 148, 136, 0.1)' : 'transparent',
+                border: `1px solid ${showManualCoords ? '#0d9488' : 'var(--border-color, #cbd5e1)'}`,
+                borderRadius: 'var(--radius-md, 6px)',
+                color: showManualCoords ? '#0f766e' : 'var(--text-main, #1e293b)',
+                fontSize: '0.8125rem',
+                fontWeight: 500,
+                cursor: 'pointer'
+              }}
+            >
+              <MapPin size={14} />
+              Manual Coordinates
+            </button>
+
+            {district && (
+              <button
+                type="button"
+                onClick={handlePinDistrictCenter}
+                title={`Pin ${district} headquarters on map`}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.25rem',
+                  padding: '0.45rem 0.65rem',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--border-color, #cbd5e1)',
+                  borderRadius: 'var(--radius-md, 6px)',
+                  color: 'var(--text-main, #1e293b)',
+                  fontSize: '0.8125rem',
+                  cursor: 'pointer'
+                }}
+              >
+                <Compass size={14} />
+                Pin District Center
+              </button>
+            )}
 
             <button
               type="button"
@@ -541,6 +695,97 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
           </div>
         </div>
 
+        {/* Manual Coordinates Entry Panel (for when GPS is unavailable or denied) */}
+        {showManualCoords && (
+          <div
+            style={{
+              padding: '0.875rem 1rem',
+              backgroundColor: '#f8fafc',
+              borderBottom: '1px solid var(--border-color, #cbd5e1)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.625rem'
+            }}
+          >
+            <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)' }}>
+              Enter Coordinates Manually (Karnataka: 11.0–19.0° N, 73.5–79.5° E)
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end' }}>
+              <div style={{ flex: '1 1 160px' }}>
+                <label htmlFor="manual-lat-input" style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted, #475569)', marginBottom: '0.25rem' }}>
+                  Latitude (° N)
+                </label>
+                <input
+                  id="manual-lat-input"
+                  type="number"
+                  step="0.000001"
+                  placeholder="e.g. 12.9716"
+                  value={manualLatInput}
+                  onChange={(e) => {
+                    setManualLatInput(e.target.value);
+                    setManualCoordError(null);
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '0.45rem 0.65rem',
+                    border: '1px solid var(--border-color, #cbd5e1)',
+                    borderRadius: 'var(--radius-md, 6px)',
+                    backgroundColor: '#ffffff',
+                    fontSize: '0.8125rem'
+                  }}
+                />
+              </div>
+
+              <div style={{ flex: '1 1 160px' }}>
+                <label htmlFor="manual-lng-input" style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted, #475569)', marginBottom: '0.25rem' }}>
+                  Longitude (° E)
+                </label>
+                <input
+                  id="manual-lng-input"
+                  type="number"
+                  step="0.000001"
+                  placeholder="e.g. 77.5946"
+                  value={manualLngInput}
+                  onChange={(e) => {
+                    setManualLngInput(e.target.value);
+                    setManualCoordError(null);
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '0.45rem 0.65rem',
+                    border: '1px solid var(--border-color, #cbd5e1)',
+                    borderRadius: 'var(--radius-md, 6px)',
+                    backgroundColor: '#ffffff',
+                    fontSize: '0.8125rem'
+                  }}
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={handleApplyManualCoordinates}
+                style={{
+                  padding: '0.5rem 0.9rem',
+                  backgroundColor: '#0d9488',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: 'var(--radius-md, 6px)',
+                  fontSize: '0.8125rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                Apply Coordinates
+              </button>
+            </div>
+            {manualCoordError && (
+              <p role="alert" style={{ margin: 0, color: '#dc2626', fontSize: '0.75rem', fontWeight: 500 }}>
+                {manualCoordError}
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Map Container */}
         <div 
           ref={mapContainerRef} 
@@ -567,18 +812,22 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
             fontSize: '0.8125rem'
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <MapPin size={16} style={{ color: '#0d9488' }} />
             <span style={{ fontWeight: 600, color: 'var(--text-main, #1e293b)' }}>Selected Coordinates:</span>
-            <span style={{ fontFamily: 'monospace', color: 'var(--text-muted, #475569)', background: '#f1f5f9', padding: '2px 6px', borderRadius: '4px' }}>
-              {latitude !== undefined && longitude !== undefined
-                ? `${latitude.toFixed(5)}° N, ${longitude.toFixed(5)}° E`
-                : '12.97160° N, 77.59460° E (Default)'}
-            </span>
+            {hasCoordinates ? (
+              <span style={{ fontFamily: 'monospace', color: 'var(--text-main, #0f172a)', background: '#f1f5f9', padding: '2px 8px', borderRadius: '4px' }}>
+                {latitude!.toFixed(5)}° N, {longitude!.toFixed(5)}° E
+              </span>
+            ) : (
+              <span style={{ color: '#b45309', background: '#fffbeb', border: '1px solid #fde68a', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 500 }}>
+                Not selected yet — use GPS, click the map, or enter coordinates
+              </span>
+            )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            {locationVerified ? (
+            {locationVerified && hasCoordinates ? (
               <span 
                 style={{
                   display: 'inline-flex',
@@ -597,15 +846,17 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
             ) : (
               <button
                 type="button"
+                disabled={!hasCoordinates}
                 onClick={() => {
+                  if (!hasCoordinates) return;
                   onChange({
                     locationVerified: true,
-                    latitude: currentLat,
-                    longitude: currentLng
+                    latitude,
+                    longitude
                   });
                   setGeoNotice({
                     type: 'success',
-                    message: `Hazard coordinates [${currentLat.toFixed(5)}, ${currentLng.toFixed(5)}] confirmed by user.`
+                    message: `Hazard coordinates [${latitude!.toFixed(5)}, ${longitude!.toFixed(5)}] confirmed by user.`
                   });
                 }}
                 style={{
@@ -613,13 +864,13 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
                   alignItems: 'center',
                   gap: '0.35rem',
                   padding: '0.35rem 0.75rem',
-                  backgroundColor: '#0d9488',
-                  color: '#ffffff',
+                  backgroundColor: hasCoordinates ? '#0d9488' : '#cbd5e1',
+                  color: hasCoordinates ? '#ffffff' : '#64748b',
                   border: 'none',
                   borderRadius: 'var(--radius-md, 6px)',
                   fontSize: '0.75rem',
                   fontWeight: 600,
-                  cursor: 'pointer'
+                  cursor: hasCoordinates ? 'pointer' : 'not-allowed'
                 }}
               >
                 <CheckCircle2 size={14} />
@@ -628,6 +879,27 @@ export const LocationPickerMap: React.FC<LocationPickerProps> = ({
             )}
           </div>
         </div>
+
+        {/* Location Error Message */}
+        {errors.location && (
+          <div
+            role="alert"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              padding: '0.625rem 1rem',
+              backgroundColor: 'rgba(239, 68, 68, 0.08)',
+              borderTop: '1px solid #fecaca',
+              color: '#b91c1c',
+              fontSize: '0.8125rem',
+              fontWeight: 500
+            }}
+          >
+            <AlertCircle size={15} style={{ flexShrink: 0 }} />
+            <span>{errors.location}</span>
+          </div>
+        )}
       </div>
     </div>
   );

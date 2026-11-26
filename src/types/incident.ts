@@ -52,7 +52,9 @@ export interface CitizenProblemReportInput {
   title: string;
   description: string;
   observedSeverity: IncidentSeverity;
+  reportedAt?: string;
   firstObserved?: string;
+  additionalNotes?: string;
   safetyIndicators: SafetyHazardIndicator[];
   
   // Location
@@ -100,6 +102,7 @@ export interface UrbanIncident {
   citizenReportedSeverity?: IncidentSeverity;
   safetyIndicators?: SafetyHazardIndicator[];
   firstObserved?: string;
+  additionalNotes?: string;
   reportedByUserId?: string;
   reportedByUserName?: string;
   reportedByUserEmail?: string;

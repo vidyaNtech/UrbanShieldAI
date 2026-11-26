@@ -901,6 +901,34 @@ class IncidentService {
    * Create and persist a new citizen problem report
    */
   public createReport(input: CitizenProblemReportInput): UrbanIncident {
+    if (!input.category) {
+      throw new Error('Problem category is required.');
+    }
+
+    if (!input.title || !input.title.trim()) {
+      throw new Error('Problem title is required.');
+    }
+
+    if (!input.description || !input.description.trim()) {
+      throw new Error('Detailed problem description is required.');
+    }
+
+    const photos = input.photos || [];
+    if (photos.length > 5) {
+      throw new Error('Maximum of 5 photographs allowed per report.');
+    }
+
+    const seenPhotoUrls = new Set<string>();
+    for (const photo of photos) {
+      if (!photo.dataUrl || !photo.dataUrl.trim()) {
+        throw new Error(`Photograph "${photo.name || 'unnamed'}" contains empty image data.`);
+      }
+      if (seenPhotoUrls.has(photo.dataUrl)) {
+        throw new Error(`Duplicate photograph detected: "${photo.name || 'unnamed'}".`);
+      }
+      seenPhotoUrls.add(photo.dataUrl);
+    }
+
     // Geographic validation: Coordinates must be valid numbers within Karnataka's geographical bounds
     // Karnataka latitude: ~11.5°N to 18.5°N, longitude: ~74.0°E to 78.6°E
     if (typeof input.latitude !== 'number' || isNaN(input.latitude) ||
@@ -983,6 +1011,11 @@ class IncidentService {
     const lng = input.longitude;
 
     const nowIso = new Date().toISOString();
+    const parsedReportedAt = input.reportedAt ? new Date(input.reportedAt) : null;
+    const reportedAtIso = parsedReportedAt && !isNaN(parsedReportedAt.getTime())
+      ? parsedReportedAt.toISOString()
+      : nowIso;
+    const trimmedAdditionalNotes = input.additionalNotes?.trim() || undefined;
 
     const initialHistory: IncidentHistoryEvent[] = [
       {
@@ -992,14 +1025,14 @@ class IncidentService {
         action: 'Citizen Incident Report Submitted',
         actorRole: 'citizen',
         actorName: input.reportedByUserName || 'Citizen Reporter',
-        timestamp: nowIso,
-        notes: `Report submitted for ${input.area}, ${input.cityOrTown}. Observed severity: ${input.observedSeverity.toUpperCase()}. Evidence photos: ${input.photos.length}.`
+        timestamp: reportedAtIso,
+        notes: `Report submitted for ${input.area}, ${input.cityOrTown}. Observed severity: ${input.observedSeverity.toUpperCase()}. Evidence photos: ${photos.length}.${trimmedAdditionalNotes ? ` Additional notes: ${trimmedAdditionalNotes}` : ''}`
       }
     ];
 
     const newIncident: UrbanIncident = {
       id: incidentId,
-      title: input.title,
+      title: input.title.trim(),
       category: input.category,
       severity: input.observedSeverity,
       // Initial status: "Submitted — Awaiting Verification"
@@ -1007,21 +1040,22 @@ class IncidentService {
       latitude: lat,
       longitude: lng,
       district: matchedDistrict ? matchedDistrict.name : input.district,
-      cityOrTown: input.cityOrTown,
-      area: input.area,
-      landmark: input.landmark,
-      description: input.description,
-      reportedAt: nowIso,
+      cityOrTown: input.cityOrTown.trim(),
+      area: input.area.trim(),
+      landmark: input.landmark?.trim() || undefined,
+      description: input.description.trim(),
+      reportedAt: reportedAtIso,
       updatedAt: nowIso,
       reportCount: 1,
       reportedByRole: 'citizen',
       dataSource: 'Citizen Response App (Verified Submission)',
       verificationStatus: 'unverified',
-      imageUrls: input.photos.map(p => p.dataUrl),
-      evidencePhotos: input.photos,
+      imageUrls: photos.map(p => p.dataUrl),
+      evidencePhotos: photos,
       citizenReportedSeverity: input.observedSeverity,
       safetyIndicators: input.safetyIndicators,
       firstObserved: input.firstObserved,
+      additionalNotes: trimmedAdditionalNotes,
       reportedByUserId: input.reportedByUserId,
       reportedByUserName: input.reportedByUserName,
       reportedByUserEmail: input.reportedByUserEmail,

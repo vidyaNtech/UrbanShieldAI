@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { PageHeader } from '../common/PageHeader';
 import { NavIcon } from '../common/NavIcon';
 import { StatusBadge } from '../common/StatusBadge';
@@ -22,8 +22,17 @@ import {
   MapPin, 
   FileText, 
   Shield, 
-  PlusCircle
+  PlusCircle,
+  Calendar,
+  Loader2,
+  Eye
 } from 'lucide-react';
+
+function getCurrentDateTimeLocalString(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
 
 interface ReportProblemViewProps {
   user: UserProfile;
@@ -56,30 +65,43 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
   const [currentStep, setCurrentStep] = useState<number>(1);
 
   // Form State
-  const [category, setCategory] = useState<IncidentCategory>('potholes');
+  const [category, setCategory] = useState<IncidentCategory | ''>('');
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  const [reportedDateTime, setReportedDateTime] = useState<string>(() => getCurrentDateTimeLocalString());
   const [observedSeverity, setObservedSeverity] = useState<IncidentSeverity>('moderate');
   const [firstObserved, setFirstObserved] = useState('');
+  const [additionalNotes, setAdditionalNotes] = useState('');
   const [safetyIndicators, setSafetyIndicators] = useState<SafetyHazardIndicator[]>([]);
 
-  // Location State
-  const [district, setDistrict] = useState(user.district || 'Bengaluru Urban');
-  const [cityOrTown, setCityOrTown] = useState('Bengaluru');
+  // Location State (never silently invent coordinates or city)
+  const [district, setDistrict] = useState(user.district || '');
+  const [cityOrTown, setCityOrTown] = useState('');
   const [area, setArea] = useState('');
   const [landmark, setLandmark] = useState('');
-  const [latitude, setLatitude] = useState<number | undefined>(12.9716);
-  const [longitude, setLongitude] = useState<number | undefined>(77.5946);
+  const [latitude, setLatitude] = useState<number | undefined>(undefined);
+  const [longitude, setLongitude] = useState<number | undefined>(undefined);
   const [locationVerified, setLocationVerified] = useState<boolean>(false);
 
   // Photo Evidence State
   const [photos, setPhotos] = useState<ReportPhotoEvidence[]>([]);
+  const [isPhotoProcessing, setIsPhotoProcessing] = useState(false);
 
   // Form Submission & UX States
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [submittedIncident, setSubmittedIncident] = useState<UrbanIncident | null>(null);
+
+  const clearError = useCallback((field: string) => {
+    setErrors(prev => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  }, []);
 
   // Toggle safety indicators
   const handleToggleSafety = (indicator: SafetyHazardIndicator) => {
@@ -93,17 +115,21 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
   // Step 1 Validation
   const validateStep1 = (): boolean => {
     const newErrors: Record<string, string> = {};
-    if (!category) newErrors.category = 'Please select a problem category.';
+    if (!category) newErrors.category = 'Please select a problem category from the dropdown.';
     if (!title.trim()) {
-      newErrors.title = 'Please enter a short descriptive title.';
+      newErrors.title = 'Please enter a problem title.';
     } else if (title.trim().length < 5) {
-      newErrors.title = 'Title must be at least 5 characters.';
+      newErrors.title = 'Problem title must be at least 5 characters.';
     }
 
     if (!description.trim()) {
-      newErrors.description = 'Please provide details about what happened and what you observed.';
+      newErrors.description = 'Please provide a detailed description of the problem.';
     } else if (description.trim().length < 15) {
       newErrors.description = 'Description should be at least 15 characters to assist verification.';
+    }
+
+    if (!reportedDateTime || isNaN(new Date(reportedDateTime).getTime())) {
+      newErrors.reportedDateTime = 'Please provide a valid date and time of reporting.';
     }
 
     if (!observedSeverity) newErrors.observedSeverity = 'Please select your observed severity.';
@@ -118,8 +144,35 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
     if (!district.trim()) newErrors.district = 'Please select a Karnataka district.';
     if (!cityOrTown.trim()) newErrors.cityOrTown = 'Please specify city, town, or taluk.';
     if (!area.trim()) newErrors.area = 'Please specify area, street, or locality.';
-    if (!locationVerified) newErrors.location = 'Please confirm the incident location on the map or via GPS before proceeding.';
 
+    const hasValidCoords =
+      typeof latitude === 'number' &&
+      !isNaN(latitude) &&
+      typeof longitude === 'number' &&
+      !isNaN(longitude) &&
+      latitude >= 11.0 &&
+      latitude <= 19.0 &&
+      longitude >= 73.5 &&
+      longitude <= 79.5;
+
+    if (!hasValidCoords) {
+      newErrors.location = 'Please select a valid Karnataka location using GPS, clicking the map, entering manual coordinates, or pinning your district center.';
+    } else if (!locationVerified) {
+      newErrors.location = 'Please click "Confirm This Location" below the map to confirm the selected coordinates before proceeding.';
+    }
+
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  // Step 3 Validation
+  const validateStep3 = (): boolean => {
+    const newErrors: Record<string, string> = {};
+    if (isPhotoProcessing) {
+      newErrors.photos = 'Please wait for photograph processing to finish before continuing.';
+    } else if (photos.length > 5) {
+      newErrors.photos = 'Maximum of 5 photographs allowed per report.';
+    }
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -133,6 +186,7 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
       if (!validateStep2()) return;
       setCurrentStep(3);
     } else if (currentStep === 3) {
+      if (!validateStep3()) return;
       setCurrentStep(4);
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -140,6 +194,7 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
 
   const handleBack = () => {
     if (currentStep > 1) {
+      setErrors({});
       setCurrentStep(prev => prev - 1);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
@@ -147,7 +202,13 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
 
   // Cancel Handler
   const handleCancelClick = () => {
-    const hasData = title.trim().length > 0 || description.trim().length > 0 || photos.length > 0;
+    const hasData =
+      Boolean(category) ||
+      title.trim().length > 0 ||
+      description.trim().length > 0 ||
+      additionalNotes.trim().length > 0 ||
+      area.trim().length > 0 ||
+      photos.length > 0;
     if (hasData) {
       setShowCancelModal(true);
     } else {
@@ -162,7 +223,7 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
 
   // Final Submission
   const handleSubmitReport = async () => {
-    if (isSubmitting) return; // Prevent concurrent rapid submissions
+    if (submittingRef.current || isSubmitting || isPhotoProcessing) return; // Prevent concurrent rapid submissions
 
     if (!validateStep1()) {
       setCurrentStep(1);
@@ -172,22 +233,30 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
       setCurrentStep(2);
       return;
     }
+    if (!validateStep3()) {
+      setCurrentStep(3);
+      return;
+    }
 
+    submittingRef.current = true;
     setIsSubmitting(true);
+    setErrors({});
 
     try {
       // Simulate minor dispatch latency
-      await new Promise(res => setTimeout(res, 400));
+      await new Promise(res => setTimeout(res, 350));
 
       const created = incidentService.createReport({
-        category,
+        category: category as IncidentCategory,
         title: title.trim(),
         description: description.trim(),
         observedSeverity,
-        firstObserved: firstObserved || undefined,
+        reportedAt: new Date(reportedDateTime).toISOString(),
+        firstObserved: firstObserved.trim() || undefined,
+        additionalNotes: additionalNotes.trim() || undefined,
         safetyIndicators,
         state: 'Karnataka',
-        district,
+        district: district.trim(),
         cityOrTown: cityOrTown.trim(),
         area: area.trim(),
         landmark: landmark.trim() || undefined,
@@ -204,8 +273,12 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       console.error('Failed to submit report', err);
-      setErrors({ submit: 'Failed to record incident report. Please try again.' });
+      const message = err instanceof Error && err.message
+        ? err.message
+        : 'Failed to record incident report. Please verify your entries and try again.';
+      setErrors({ submit: message });
     } finally {
+      submittingRef.current = false;
       setIsSubmitting(false);
     }
   };
@@ -214,13 +287,23 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
   const handleResetForAnother = () => {
     setSubmittedIncident(null);
     setCurrentStep(1);
+    setCategory('');
     setTitle('');
     setDescription('');
+    setReportedDateTime(getCurrentDateTimeLocalString());
+    setObservedSeverity('moderate');
+    setFirstObserved('');
+    setAdditionalNotes('');
+    setSafetyIndicators([]);
+    setDistrict(user.district || '');
+    setCityOrTown('');
     setArea('');
     setLandmark('');
+    setLatitude(undefined);
+    setLongitude(undefined);
+    setLocationVerified(false);
     setPhotos([]);
-    setSafetyIndicators([]);
-    setFirstObserved('');
+    setErrors({});
   };
 
   // ==========================================
@@ -359,6 +442,27 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
 
             <button
               type="button"
+              onClick={() => onNavigate(`#/incidents/${submittedIncident.id}`)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                padding: '0.75rem 1.25rem',
+                backgroundColor: 'var(--bg-card, #ffffff)',
+                color: 'var(--text-main, #1e293b)',
+                border: '1px solid var(--border-color, #cbd5e1)',
+                borderRadius: 'var(--radius-md, 8px)',
+                fontWeight: 600,
+                fontSize: '0.9375rem',
+                cursor: 'pointer'
+              }}
+            >
+              <Eye size={18} style={{ color: '#0d9488' }} />
+              View Report Details
+            </button>
+
+            <button
+              type="button"
               onClick={() => onNavigate('#/risk-map')}
               style={{
                 display: 'inline-flex',
@@ -443,6 +547,8 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: '0.75rem',
           backgroundColor: 'var(--bg-card, #ffffff)',
           borderRadius: 'var(--radius-md, 8px)',
           border: '1px solid var(--border-color, #cbd5e1)',
@@ -612,11 +718,46 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
               </p>
             </div>
 
-            {/* Category Selector Grid */}
+            {/* Category Dropdown + Visual Quick Selector */}
             <div>
-              <label style={{ display: 'block', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)', marginBottom: '0.625rem' }}>
+              <label
+                htmlFor="report-category"
+                style={{ display: 'block', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)', marginBottom: '0.375rem' }}
+              >
                 Problem Category <span style={{ color: '#ef4444' }}>*</span>
               </label>
+
+              <select
+                id="report-category"
+                value={category}
+                onChange={(e) => {
+                  setCategory(e.target.value as IncidentCategory | '');
+                  clearError('category');
+                }}
+                aria-invalid={Boolean(errors.category)}
+                style={{
+                  width: '100%',
+                  padding: '0.625rem 0.875rem',
+                  backgroundColor: 'var(--bg-card, #ffffff)',
+                  border: errors.category ? '1.5px solid #ef4444' : '1px solid var(--border-color, #cbd5e1)',
+                  borderRadius: 'var(--radius-md, 6px)',
+                  fontSize: '0.875rem',
+                  fontWeight: 500,
+                  color: category ? 'var(--text-main, #1e293b)' : 'var(--text-muted, #64748b)',
+                  marginBottom: '0.75rem'
+                }}
+              >
+                <option value="">Select a problem category...</option>
+                {INCIDENT_CATEGORIES.map(cat => (
+                  <option key={cat.id} value={cat.id}>
+                    {cat.id === 'other_civic'
+                      ? 'Other Civic Problem (Streetlight Failures, Public Safety, Signage)'
+                      : cat.id === 'water_stress'
+                        ? 'Water Stress / Water Supply Issues'
+                        : cat.label}
+                  </option>
+                ))}
+              </select>
 
               <div 
                 style={{
@@ -631,7 +772,10 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                     <button
                       key={cat.id}
                       type="button"
-                      onClick={() => setCategory(cat.id)}
+                      onClick={() => {
+                        setCategory(cat.id);
+                        clearError('category');
+                      }}
                       style={{
                         display: 'flex',
                         alignItems: 'center',
@@ -670,25 +814,35 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                   );
                 })}
               </div>
+
+              {category && (
+                <p style={{ fontSize: '0.75rem', color: 'var(--text-muted, #64748b)', marginTop: '0.5rem', marginBottom: 0 }}>
+                  {getCategoryMeta(category).description}
+                </p>
+              )}
               {errors.category && (
-                <p style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.375rem' }}>{errors.category}</p>
+                <p role="alert" style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.375rem', fontWeight: 500 }}>{errors.category}</p>
               )}
             </div>
 
-            {/* Short Title */}
+            {/* Problem Title */}
             <div>
               <label 
                 htmlFor="report-title"
                 style={{ display: 'block', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)', marginBottom: '0.375rem' }}
               >
-                Short Title <span style={{ color: '#ef4444' }}>*</span>
+                Problem Title <span style={{ color: '#ef4444' }}>*</span>
               </label>
               <input
                 id="report-title"
                 type="text"
                 placeholder='e.g. Deep pothole near the bus stop on Outer Ring Road'
                 value={title}
-                onChange={(e) => setTitle(e.target.value)}
+                onChange={(e) => {
+                  setTitle(e.target.value);
+                  clearError('title');
+                }}
+                aria-invalid={Boolean(errors.title)}
                 style={{
                   width: '100%',
                   padding: '0.625rem 0.875rem',
@@ -700,24 +854,33 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                 }}
               />
               {errors.title && (
-                <p style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.25rem' }}>{errors.title}</p>
+                <p role="alert" style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.25rem', fontWeight: 500 }}>{errors.title}</p>
               )}
             </div>
 
             {/* Detailed Description */}
             <div>
-              <label 
-                htmlFor="report-description"
-                style={{ display: 'block', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)', marginBottom: '0.375rem' }}
-              >
-                Description <span style={{ color: '#ef4444' }}>*</span>
-              </label>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.375rem' }}>
+                <label 
+                  htmlFor="report-description"
+                  style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)' }}
+                >
+                  Detailed Description <span style={{ color: '#ef4444' }}>*</span>
+                </label>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted, #64748b)' }}>
+                  {description.trim().length} characters (min 15)
+                </span>
+              </div>
               <textarea
                 id="report-description"
                 rows={4}
                 placeholder="Explain what happened, what you observed, approximate dimensions, and whether the issue is getting worse after recent rain..."
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={(e) => {
+                  setDescription(e.target.value);
+                  clearError('description');
+                }}
+                aria-invalid={Boolean(errors.description)}
                 style={{
                   width: '100%',
                   padding: '0.625rem 0.875rem',
@@ -731,7 +894,60 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                 }}
               />
               {errors.description && (
-                <p style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.25rem' }}>{errors.description}</p>
+                <p role="alert" style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.25rem', fontWeight: 500 }}>{errors.description}</p>
+              )}
+            </div>
+
+            {/* Date & Time of Reporting (Auto-Populated) */}
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.375rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <label
+                  htmlFor="report-datetime"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '0.375rem', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)' }}
+                >
+                  <Calendar size={14} style={{ color: '#0d9488' }} />
+                  Date and Time of Reporting <span style={{ color: '#ef4444' }}>*</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReportedDateTime(getCurrentDateTimeLocalString());
+                    clearError('reportedDateTime');
+                  }}
+                  style={{
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    color: '#0d9488',
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    textDecoration: 'underline'
+                  }}
+                >
+                  Set to Current Time
+                </button>
+              </div>
+              <input
+                id="report-datetime"
+                type="datetime-local"
+                value={reportedDateTime}
+                onChange={(e) => {
+                  setReportedDateTime(e.target.value);
+                  clearError('reportedDateTime');
+                }}
+                aria-invalid={Boolean(errors.reportedDateTime)}
+                style={{
+                  width: '100%',
+                  padding: '0.625rem 0.875rem',
+                  backgroundColor: 'var(--bg-card, #ffffff)',
+                  border: errors.reportedDateTime ? '1.5px solid #ef4444' : '1px solid var(--border-color, #cbd5e1)',
+                  borderRadius: 'var(--radius-md, 6px)',
+                  fontSize: '0.875rem',
+                  color: 'var(--text-main, #1e293b)'
+                }}
+              />
+              {errors.reportedDateTime && (
+                <p role="alert" style={{ color: '#ef4444', fontSize: '0.75rem', marginTop: '0.25rem', fontWeight: 500 }}>{errors.reportedDateTime}</p>
               )}
             </div>
 
@@ -813,6 +1029,34 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                   borderRadius: 'var(--radius-md, 6px)',
                   fontSize: '0.875rem',
                   color: 'var(--text-main, #1e293b)'
+                }}
+              />
+            </div>
+
+            {/* Additional Notes (Optional) */}
+            <div>
+              <label
+                htmlFor="report-additional-notes"
+                style={{ display: 'block', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main, #1e293b)', marginBottom: '0.375rem' }}
+              >
+                Additional Notes (Optional)
+              </label>
+              <textarea
+                id="report-additional-notes"
+                rows={2}
+                placeholder="Any extra context for field crews (e.g. best access lane, school/hospital nearby, peak traffic hours)..."
+                value={additionalNotes}
+                onChange={(e) => setAdditionalNotes(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.625rem 0.875rem',
+                  backgroundColor: 'var(--bg-card, #ffffff)',
+                  border: '1px solid var(--border-color, #cbd5e1)',
+                  borderRadius: 'var(--radius-md, 6px)',
+                  fontSize: '0.875rem',
+                  color: 'var(--text-main, #1e293b)',
+                  lineHeight: 1.45,
+                  fontFamily: 'inherit'
                 }}
               />
             </div>
@@ -905,13 +1149,31 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
               longitude={longitude}
               locationVerified={locationVerified}
               onChange={(fields) => {
-                if (fields.district !== undefined) setDistrict(fields.district);
-                if (fields.cityOrTown !== undefined) setCityOrTown(fields.cityOrTown);
-                if (fields.area !== undefined) setArea(fields.area);
+                if (fields.district !== undefined) {
+                  setDistrict(fields.district);
+                  clearError('district');
+                }
+                if (fields.cityOrTown !== undefined) {
+                  setCityOrTown(fields.cityOrTown);
+                  clearError('cityOrTown');
+                }
+                if (fields.area !== undefined) {
+                  setArea(fields.area);
+                  clearError('area');
+                }
                 if (fields.landmark !== undefined) setLandmark(fields.landmark);
-                if (fields.latitude !== undefined) setLatitude(fields.latitude);
-                if (fields.longitude !== undefined) setLongitude(fields.longitude);
-                if (fields.locationVerified !== undefined) setLocationVerified(fields.locationVerified);
+                if (fields.latitude !== undefined) {
+                  setLatitude(fields.latitude);
+                  clearError('location');
+                }
+                if (fields.longitude !== undefined) {
+                  setLongitude(fields.longitude);
+                  clearError('location');
+                }
+                if (fields.locationVerified !== undefined) {
+                  setLocationVerified(fields.locationVerified);
+                  if (fields.locationVerified) clearError('location');
+                }
               }}
               errors={errors}
             />
@@ -934,10 +1196,20 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
 
             <PhotoEvidenceUpload
               photos={photos}
-              onChange={setPhotos}
+              onChange={(nextPhotos) => {
+                setPhotos(nextPhotos);
+                clearError('photos');
+              }}
               maxFiles={5}
               maxSizeMb={10}
+              onProcessingChange={setIsPhotoProcessing}
             />
+
+            {errors.photos && (
+              <p role="alert" style={{ color: '#ef4444', fontSize: '0.8125rem', margin: 0, fontWeight: 500 }}>
+                {errors.photos}
+              </p>
+            )}
           </div>
         )}
 
@@ -987,31 +1259,45 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                   </button>
                 </div>
 
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.625rem', marginBottom: '0.5rem' }}>
-                  <div 
-                    style={{
-                      padding: '4px 8px',
-                      borderRadius: '4px',
-                      backgroundColor: getCategoryMeta(category).bgColor,
-                      border: `1px solid ${getCategoryMeta(category).borderColor}`,
-                      color: getCategoryMeta(category).color,
-                      fontSize: '0.8125rem',
-                      fontWeight: 600,
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.375rem'
-                    }}
-                  >
-                    <NavIcon name={getCategoryMeta(category).iconName} size={14} />
-                    {getCategoryMeta(category).label}
-                  </div>
+                {category && (() => {
+                  const catMeta = getCategoryMeta(category);
+                  return (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.625rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                      <div 
+                        style={{
+                          padding: '4px 8px',
+                          borderRadius: '4px',
+                          backgroundColor: catMeta.bgColor,
+                          border: `1px solid ${catMeta.borderColor}`,
+                          color: catMeta.color,
+                          fontSize: '0.8125rem',
+                          fontWeight: 600,
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.375rem'
+                        }}
+                      >
+                        <NavIcon name={catMeta.iconName} size={14} />
+                        {catMeta.label}
+                      </div>
 
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted, #64748b)' }}>•</span>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted, #64748b)' }}>•</span>
 
-                  <span style={{ fontSize: '0.8125rem', color: 'var(--text-main, #1e293b)' }}>
-                    Observed Severity: <strong style={{ textTransform: 'capitalize' }}>{observedSeverity}</strong>
-                  </span>
-                </div>
+                      <span style={{ fontSize: '0.8125rem', color: 'var(--text-main, #1e293b)' }}>
+                        Observed Severity: <strong style={{ textTransform: 'capitalize' }}>{observedSeverity}</strong>
+                      </span>
+
+                      {reportedDateTime && (
+                        <>
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted, #64748b)' }}>•</span>
+                          <span style={{ fontSize: '0.8125rem', color: 'var(--text-muted, #64748b)' }}>
+                            Reported: <strong>{new Date(reportedDateTime).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</strong>
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <h4 style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--text-main, #0f172a)', margin: '0 0 0.5rem 0' }}>
                   {title}
@@ -1022,8 +1308,14 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                 </p>
 
                 {firstObserved && (
-                  <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted, #64748b)', marginBottom: '0.5rem' }}>
+                  <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted, #64748b)', marginBottom: '0.35rem' }}>
                     <strong>First Observed:</strong> {firstObserved}
+                  </div>
+                )}
+
+                {additionalNotes.trim() && (
+                  <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted, #64748b)', marginBottom: '0.5rem' }}>
+                    <strong>Additional Notes:</strong> {additionalNotes.trim()}
                   </div>
                 )}
 
@@ -1090,13 +1382,15 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                   <div>
                     <span style={{ fontSize: '0.75rem', color: 'var(--text-muted, #64748b)', display: 'block' }}>Coordinates</span>
                     <span style={{ fontFamily: 'monospace', fontSize: '0.8125rem', background: '#e2e8f0', padding: '2px 6px', borderRadius: '4px' }}>
-                      {latitude?.toFixed(5)}° N, {longitude?.toFixed(5)}° E
+                      {latitude !== undefined && longitude !== undefined
+                        ? `${latitude.toFixed(5)}° N, ${longitude.toFixed(5)}° E`
+                        : 'Not selected'}
                     </span>
                     <div style={{ marginTop: '4px' }}>
                       {locationVerified ? (
-                        <span style={{ color: '#059669', fontSize: '0.75rem', fontWeight: 600 }}>GPS Verified</span>
+                        <span style={{ color: '#059669', fontSize: '0.75rem', fontWeight: 600 }}>Location Confirmed</span>
                       ) : (
-                        <span style={{ color: '#b45309', fontSize: '0.75rem' }}>Manually Specified</span>
+                        <span style={{ color: '#b45309', fontSize: '0.75rem' }}>Pending Confirmation</span>
                       )}
                     </div>
                   </div>
@@ -1162,14 +1456,16 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
 
             {/* Error Message */}
             {errors.submit && (
-              <div 
+              <div
+                role="alert"
                 style={{
                   padding: '0.75rem 1rem',
                   backgroundColor: 'rgba(239, 68, 68, 0.1)',
                   border: '1px solid #ef4444',
                   borderRadius: 'var(--radius-md, 6px)',
                   color: '#b91c1c',
-                  fontSize: '0.875rem'
+                  fontSize: '0.875rem',
+                  fontWeight: 500
                 }}
               >
                 {errors.submit}
@@ -1186,6 +1482,8 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '0.75rem',
             borderTop: '1px solid var(--border-color, #e2e8f0)',
             paddingTop: '1.25rem',
             marginTop: '0.5rem'
@@ -1207,7 +1505,7 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
                 borderRadius: 'var(--radius-md, 6px)',
                 fontWeight: 600,
                 fontSize: '0.875rem',
-                cursor: 'pointer'
+                cursor: isSubmitting ? 'not-allowed' : 'pointer'
               }}
             >
               <ChevronLeft size={16} />
@@ -1236,47 +1534,48 @@ export const ReportProblemView: React.FC<ReportProblemViewProps> = ({ user, onNa
               <button
                 type="button"
                 onClick={handleNext}
+                disabled={currentStep === 3 && isPhotoProcessing}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: '0.375rem',
                   padding: '0.625rem 1.25rem',
-                  backgroundColor: '#0d9488',
+                  backgroundColor: currentStep === 3 && isPhotoProcessing ? '#64748b' : '#0d9488',
                   color: '#ffffff',
                   border: 'none',
                   borderRadius: 'var(--radius-md, 6px)',
                   fontWeight: 600,
                   fontSize: '0.875rem',
-                  cursor: 'pointer',
+                  cursor: currentStep === 3 && isPhotoProcessing ? 'not-allowed' : 'pointer',
                   boxShadow: 'var(--shadow-sm, 0 1px 2px rgba(0,0,0,0.1))'
                 }}
               >
-                Continue
+                {currentStep === 3 && isPhotoProcessing ? 'Processing Photos...' : 'Continue'}
                 <ChevronRight size={16} />
               </button>
             ) : (
               <button
                 type="button"
                 onClick={handleSubmitReport}
-                disabled={isSubmitting}
+                disabled={isSubmitting || isPhotoProcessing}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: '0.5rem',
                   padding: '0.75rem 1.75rem',
-                  backgroundColor: isSubmitting ? '#64748b' : '#0d9488',
+                  backgroundColor: isSubmitting || isPhotoProcessing ? '#64748b' : '#0d9488',
                   color: '#ffffff',
                   border: 'none',
                   borderRadius: 'var(--radius-md, 6px)',
                   fontWeight: 700,
                   fontSize: '0.9375rem',
-                  cursor: isSubmitting ? 'not-allowed' : 'pointer',
+                  cursor: isSubmitting || isPhotoProcessing ? 'not-allowed' : 'pointer',
                   boxShadow: 'var(--shadow-md, 0 4px 6px -1px rgba(13, 148, 136, 0.35))'
                 }}
               >
                 {isSubmitting ? (
                   <>
-                    <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true" />
+                    <Loader2 size={18} className="animate-spin" />
                     Submitting Report...
                   </>
                 ) : (

@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import type { ReportPhotoEvidence } from '../../types/incident';
 import { 
   UploadCloud, 
@@ -6,7 +6,8 @@ import {
   AlertCircle, 
   CheckCircle2, 
   Sparkles, 
-  Info
+  Info,
+  Loader2
 } from 'lucide-react';
 
 interface PhotoEvidenceUploadProps {
@@ -14,31 +15,72 @@ interface PhotoEvidenceUploadProps {
   onChange: (photos: ReportPhotoEvidence[]) => void;
   maxFiles?: number;
   maxSizeMb?: number;
+  onProcessingChange?: (isProcessing: boolean) => void;
+}
+
+const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp'];
+
+function hasAllowedExtension(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return ALLOWED_EXTENSIONS.some(ext => lower.endsWith(ext));
+}
+
+function isValidImageDataUrl(dataUrl: string): boolean {
+  if (!dataUrl || !dataUrl.trim()) return false;
+  if (!dataUrl.startsWith('data:image/')) return false;
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx === -1) return false;
+  const payload = dataUrl.slice(commaIdx + 1).trim();
+  return payload.length > 0;
+}
+
+function verifyImageDecodable(dataUrl: string): Promise<boolean> {
+  if (typeof Image === 'undefined') {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img.naturalWidth > 0 && img.naturalHeight > 0);
+    img.onerror = () => resolve(false);
+    img.src = dataUrl;
+  });
 }
 
 export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
   photos,
   onChange,
   maxFiles = 5,
-  maxSizeMb = 10
+  maxSizeMb = 10,
+  onProcessingChange
 }) => {
   const [dragActive, setDragActive] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [processingState, setProcessingState] = useState<{ active: boolean; total: number; completed: number }>({
+    active: false,
+    total: 0,
+    completed: 0
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Track ongoing reader operations to prevent concurrent selections from exceeding maxFiles
   const pendingCountRef = useRef<number>(0);
+  // Keep latest photos ref so async reader completion never writes stale snapshots
+  const photosRef = useRef<ReportPhotoEvidence[]>(photos);
+  photosRef.current = photos;
 
-  const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+  useEffect(() => {
+    onProcessingChange?.(processingState.active);
+  }, [processingState.active, onProcessingChange]);
 
   const processFiles = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
     setErrorMsg(null);
 
     // Account for both confirmed photos and photos currently being read by FileReader
-    const activeTotal = photos.length + pendingCountRef.current;
+    const activeTotal = photosRef.current.length + pendingCountRef.current;
     const remainingSlots = maxFiles - activeTotal;
     if (remainingSlots <= 0) {
-      setErrorMsg(`Maximum of ${maxFiles} photographs allowed per report. (${pendingCountRef.current} upload(s) currently in progress).`);
+      setErrorMsg(`Maximum of ${maxFiles} photographs allowed per report.${pendingCountRef.current > 0 ? ` (${pendingCountRef.current} upload(s) currently in progress).` : ''}`);
       return;
     }
 
@@ -46,22 +88,40 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
     const messages: string[] = [];
 
     if (allSelected.length > remainingSlots) {
-      messages.push(`Only ${remainingSlots} photo slot(s) available. The last ${allSelected.length - remainingSlots} file(s) were not queued.`);
+      messages.push(`Only ${remainingSlots} photo slot(s) available (maximum ${maxFiles} photos). ${allSelected.length - remainingSlots} extra file(s) were skipped.`);
     }
 
     const candidateFiles = allSelected.slice(0, remainingSlots);
     const validFiles: File[] = [];
 
     candidateFiles.forEach(file => {
-      // Validate file type
-      if (!allowedTypes.includes(file.type)) {
-        messages.push(`"${file.name}" is not a supported format (JPG, PNG, WEBP).`);
+      // Reject empty files immediately
+      if (file.size <= 0) {
+        messages.push(`"${file.name}" is empty (0 bytes) and cannot be uploaded.`);
+        return;
+      }
+
+      // Validate file type (MIME check, plus extension check when browser leaves type empty)
+      const mimeAllowed = file.type
+        ? ALLOWED_MIME_TYPES.includes(file.type.toLowerCase())
+        : hasAllowedExtension(file.name);
+      if (!mimeAllowed) {
+        messages.push(`"${file.name}" is not a supported format. Please upload JPG, PNG, or WEBP images.`);
         return;
       }
 
       // Validate size
       if (file.size > maxSizeMb * 1024 * 1024) {
         messages.push(`"${file.name}" exceeds the ${maxSizeMb}MB maximum limit.`);
+        return;
+      }
+
+      // Prevent duplicate files by name + size against existing and current batch
+      const isMetadataDuplicate =
+        photosRef.current.some(p => p.name === file.name && p.size === file.size) ||
+        validFiles.some(f => f.name === file.name && f.size === file.size);
+      if (isMetadataDuplicate) {
+        messages.push(`"${file.name}" has already been added.`);
         return;
       }
 
@@ -78,6 +138,7 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
 
     // Reserve pending slots immediately so rapid successive selections respect the quota
     pendingCountRef.current += validFiles.length;
+    setProcessingState({ active: true, total: validFiles.length, completed: 0 });
 
     const newPhotos: ReportPhotoEvidence[] = [];
     let completedCount = 0;
@@ -85,47 +146,66 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
     validFiles.forEach(file => {
       const reader = new FileReader();
 
-      const finishOne = (loadedPhoto?: ReportPhotoEvidence) => {
+      const finishOne = (loadedPhoto?: ReportPhotoEvidence, failureReason?: string) => {
         completedCount++;
         pendingCountRef.current = Math.max(0, pendingCountRef.current - 1);
-        
-        if (loadedPhoto) {
+
+        if (failureReason) {
+          messages.push(failureReason);
+          setErrorMsg(messages.join(' '));
+        } else if (loadedPhoto) {
           // Content-aware deduplication: check if identical image dataUrl is already present
-          const isContentDuplicate = photos.some(p => p.dataUrl === loadedPhoto.dataUrl) ||
-                                     newPhotos.some(p => p.dataUrl === loadedPhoto.dataUrl);
+          const isContentDuplicate =
+            photosRef.current.some(p => p.dataUrl === loadedPhoto.dataUrl) ||
+            newPhotos.some(p => p.dataUrl === loadedPhoto.dataUrl);
           if (isContentDuplicate) {
-            setErrorMsg(`"${loadedPhoto.name}" contains duplicate image content to an existing upload.`);
+            messages.push(`"${loadedPhoto.name}" contains duplicate image content to an existing upload.`);
+            setErrorMsg(messages.join(' '));
           } else {
             newPhotos.push(loadedPhoto);
           }
         }
 
+        setProcessingState({
+          active: pendingCountRef.current > 0,
+          total: validFiles.length,
+          completed: completedCount
+        });
+
         if (completedCount === validFiles.length) {
           if (newPhotos.length > 0) {
-            onChange([...photos, ...newPhotos]);
+            const merged = [...photosRef.current, ...newPhotos].slice(0, maxFiles);
+            photosRef.current = merged;
+            onChange(merged);
           }
+          setProcessingState({ active: false, total: 0, completed: 0 });
         }
       };
 
-      reader.onload = (e) => {
-        const result = e.target?.result as string;
-        if (result && result.trim().length > 0) {
-          finishOne({
-            id: `photo-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
-            name: file.name,
-            size: file.size,
-            dataUrl: result,
-            uploadedAt: new Date().toISOString()
-          });
-        } else {
-          setErrorMsg(`Empty or unreadable data in "${file.name}".`);
-          finishOne();
+      reader.onload = async (e) => {
+        const result = (e.target?.result as string) || '';
+        if (!isValidImageDataUrl(result)) {
+          finishOne(undefined, `Empty or invalid image data in "${file.name}".`);
+          return;
         }
+
+        const isDecodable = await verifyImageDecodable(result);
+        if (!isDecodable) {
+          finishOne(undefined, `"${file.name}" does not contain valid, readable image data.`);
+          return;
+        }
+
+        finishOne({
+          id: `photo-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+          name: file.name,
+          size: file.size,
+          dataUrl: result,
+          uploadedAt: new Date().toISOString()
+        });
       };
 
       reader.onerror = () => {
-        setErrorMsg(`Failed to read "${file.name}".`);
-        finishOne();
+        finishOne(undefined, `Failed to read "${file.name}".`);
       };
 
       reader.readAsDataURL(file);
@@ -190,7 +270,8 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
 
       {/* Error Message */}
       {errorMsg && (
-        <div 
+        <div
+          role="alert"
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -207,11 +288,51 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
           <span>{errorMsg}</span>
           <button
             type="button"
+            aria-label="Dismiss photo upload error"
             onClick={() => setErrorMsg(null)}
             style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#b91c1c' }}
           >
             ✕
           </button>
+        </div>
+      )}
+
+      {/* Upload / Processing Progress Banner */}
+      {processingState.active && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '0.5rem',
+            padding: '0.75rem 1rem',
+            backgroundColor: 'rgba(13, 148, 136, 0.08)',
+            border: '1px solid #0d9488',
+            borderRadius: 'var(--radius-md, 6px)',
+            color: '#0f766e',
+            fontSize: '0.8125rem'
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600 }}>
+              <Loader2 size={15} className="animate-spin" />
+              Processing photograph(s)... ({processingState.completed} of {processingState.total})
+            </span>
+            <span style={{ fontWeight: 700 }}>
+              {processingState.total > 0 ? Math.round((processingState.completed / processingState.total) * 100) : 0}%
+            </span>
+          </div>
+          <div style={{ height: '6px', width: '100%', backgroundColor: '#ccfbf1', borderRadius: '999px', overflow: 'hidden' }}>
+            <div
+              style={{
+                height: '100%',
+                width: `${processingState.total > 0 ? Math.round((processingState.completed / processingState.total) * 100) : 0}%`,
+                backgroundColor: '#0d9488',
+                transition: 'width 150ms ease'
+              }}
+            />
+          </div>
         </div>
       )}
 
@@ -221,7 +342,11 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
         onDragOver={handleDrag}
         onDragLeave={handleDrag}
         onDrop={handleDrop}
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => {
+          if (photos.length + pendingCountRef.current < maxFiles) {
+            fileInputRef.current?.click();
+          }
+        }}
         style={{
           display: 'flex',
           flexDirection: 'column',
@@ -232,6 +357,7 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
           border: `2px dashed ${dragActive ? '#0d9488' : 'var(--border-color, #cbd5e1)'}`,
           backgroundColor: dragActive ? 'rgba(13, 148, 136, 0.05)' : 'var(--bg-muted, #f8fafc)',
           cursor: photos.length >= maxFiles ? 'not-allowed' : 'pointer',
+          opacity: photos.length >= maxFiles ? 0.75 : 1,
           transition: 'all 0.2s ease',
           textAlign: 'center'
         }}
@@ -242,7 +368,10 @@ export const PhotoEvidenceUpload: React.FC<PhotoEvidenceUploadProps> = ({
           accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
           multiple
           disabled={photos.length >= maxFiles}
-          onChange={(e) => processFiles(e.target.files)}
+          onChange={(e) => {
+            processFiles(e.target.files);
+            e.target.value = '';
+          }}
           style={{ display: 'none' }}
         />
 
